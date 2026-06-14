@@ -60,6 +60,7 @@ export function loadDatabase(): DatabaseSchema {
       const db = JSON.parse(content);
       // Ensure structure is correct
       if (!db.admins || !db.restaurants) {
+        console.warn(`Database schema invalid in ${DB_FILE_PATH}, loading fallback.`);
         return getInitialDatabase();
       }
       if (!db.superadminPassword) {
@@ -74,7 +75,10 @@ export function loadDatabase(): DatabaseSchema {
       if (!db.orders) {
         db.orders = [];
       }
+      console.log(`Database loaded successfully from ${DB_FILE_PATH}. Admins count: ${db.admins.length}, Restaurants count: ${Object.keys(db.restaurants).length}`);
       return db;
+    } else {
+      console.log(`Database file does not exist at ${DB_FILE_PATH}. Creating and loading initial database.`);
     }
   } catch (error) {
     console.error("Error reading database file, using fallback:", error);
