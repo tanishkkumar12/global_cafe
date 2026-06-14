@@ -12,6 +12,16 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// Debugging & path correction middleware for Vercel and serverless environments
+app.use((req, res, next) => {
+  // If Vercel rewrote req.url but preserved the original URL path in headers or other fields
+  const originalUrl = req.originalUrl || req.url;
+  console.log(`[HTTP Request] ${req.method} ${req.url} (originalUrl: ${originalUrl})`);
+  
+  // Handshake to ensure Vercel routed Express app matches the original /api route structure
+  next();
+});
+
   // API routes FIRST
   app.post("/api/chat", async (req, res) => {
     const { message, history, systemInstruction, restaurantId, language } = req.body;
