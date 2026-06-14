@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import { RestaurantConfig, DEFAULT_CONFIG, Order } from "./src/types";
 
 export interface AdminUser {
@@ -25,7 +26,63 @@ export interface DatabaseSchema {
   orders?: Order[];
 }
 
-const DB_FILE_PATH = path.join(process.cwd(), "db.json");
+let DB_FILE_PATH = path.join(process.cwd(), "db.json");
+
+// Find the file name and directory path in a manner compatible with ES Modules
+let currentDirname = "";
+try {
+  currentDirname = path.dirname(fileURLToPath(import.meta.url));
+} catch (e) {
+  // Fallback in case of environments where import.meta.url is not defined
+}
+
+// Locate the bundled db.json template
+const possiblePaths = [
+  path.join(process.cwd(), "db.json"),
+];
+if (currentDirname) {
+  possiblePaths.push(path.resolve(path.join(currentDirname, "db.json")));
+  possiblePaths.push(path.resolve(path.join(currentDirname, "..", "db.json")));
+}
+
+let sourceDbPath = "";
+for (const p of possiblePaths) {
+  if (fs.existsSync(p)) {
+    sourceDbPath = p;
+    break;
+  }
+}
+
+// If on Vercel or under serverless conditions, copy db.json to a writable location (/tmp/db.json)
+if (process.env.VERCEL || process.env.NOW_REGION || process.env.AWS_EXECUTION_ENV) {
+  const tmpPath = "/tmp/db.json";
+  try {
+    if (!fs.existsSync(tmpPath)) {
+      if (sourceDbPath) {
+        fs.copyFileSync(sourceDbPath, tmpPath);
+        console.log(`[DB Setup] Copied database template from ${sourceDbPath} to writable path ${tmpPath}`);
+      } else {
+        // Create an empty initial db
+        const initial = getInitialDatabase();
+        fs.writeFileSync(tmpPath, JSON.stringify(initial, null, 2), "utf-8");
+        console.log(`[DB Setup] Created new initial database in writable path ${tmpPath}`);
+      }
+    } else {
+      console.log(`[DB Setup] Using existing writable database cloned in ${tmpPath}`);
+    }
+    DB_FILE_PATH = tmpPath;
+  } catch (err) {
+    console.error(`[DB Setup] Error setting up writable database in /tmp:`, err);
+    if (sourceDbPath) {
+      DB_FILE_PATH = sourceDbPath;
+    }
+  }
+} else {
+  if (sourceDbPath) {
+    DB_FILE_PATH = sourceDbPath;
+  }
+  console.log(`[DB Setup] SQLite-equivalent JSON Database File Path resolved to: ${DB_FILE_PATH}`);
+}
 
 function getInitialDatabase(): DatabaseSchema {
   const defaultRestoId = "resto-roasted-bean";

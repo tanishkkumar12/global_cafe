@@ -7,18 +7,61 @@ import dotenv from "dotenv";
 import { loadDatabase, saveDatabase } from "./server-db";
 import { DEFAULT_CONFIG } from "./src/types";
 
-dotenv.config();
+dotenv.config({ override: true });
+
+function cleanApiKey(key: string | undefined): string | null {
+  if (!key) return null;
+  const clean = key.replace(/^["']|["']$/g, "").trim();
+  if (
+    clean === "" ||
+    clean === "undefined" ||
+    clean === "null" ||
+    clean.includes("your_api_key_here") ||
+    clean.includes("REPLACE_ME") ||
+    clean.includes("a140b5a5924c") || // dummy key
+    clean.startsWith("sk-or-v1-a140b") // dummy key prefix
+  ) {
+    return null;
+  }
+  return clean;
+}
+
+console.log("[DB Setup] OPENROUTER_API_KEY presence from env:", !!cleanApiKey(process.env.OPENROUTER_API_KEY));
+console.log("[DB Setup] GEMINI_API_KEY presence from env:", !!cleanApiKey(process.env.GEMINI_API_KEY));
+if (process.env.OPENROUTER_API_KEY) {
+  const k = cleanApiKey(process.env.OPENROUTER_API_KEY);
+  if (k) {
+    console.log(`[DB Setup] Valid OPENROUTER_API_KEY detected: length=${k.length}, startsWith=${k.substring(0, 12)}...`);
+  } else {
+    console.log(`[DB Setup] OPENROUTER_API_KEY in process.env detected as dummy or blank placeholder.`);
+  }
+}
 
 const app = express();
 app.use(express.json());
 
 // Debugging & path correction middleware for Vercel and serverless environments
 app.use((req, res, next) => {
-  // If Vercel rewrote req.url but preserved the original URL path in headers or other fields
   const originalUrl = req.originalUrl || req.url;
   console.log(`[HTTP Request] ${req.method} ${req.url} (originalUrl: ${originalUrl})`);
   
-  // Handshake to ensure Vercel routed Express app matches the original /api route structure
+  const isServerless = process.env.VERCEL || process.env.NOW_REGION || process.env.AWS_EXECUTION_ENV;
+  if (isServerless) {
+    // Under Vercel or ephemeral serverless deployments, req.url might have been modified to strip out "/api".
+    // For example, if a client posts to "/api/login", req.url inside the function might be just "/login".
+    // We normalize req.url back so that the Express router matches our "/api/..." endpoints.
+    if (req.url && !req.url.startsWith("/api") && req.url !== "/") {
+      console.log(`[Vercel Rewriter] Normalizing req.url from "${req.url}" to "/api${req.url}"`);
+      req.url = "/api" + req.url;
+    } else if (req.url === "/") {
+      // If Vercel rewrote the URL to "/" but the client originally targeted "/api/[route]"
+      if (originalUrl && originalUrl.startsWith("/api/") && originalUrl !== "/api/") {
+        console.log(`[Vercel Rewriter] Restoring req.url to originalUrl: "${originalUrl}"`);
+        req.url = originalUrl;
+      }
+    }
+  }
+  
   next();
 });
 
@@ -26,21 +69,25 @@ app.use((req, res, next) => {
   app.post("/api/chat", async (req, res) => {
     const { message, history, systemInstruction, restaurantId, language } = req.body;
 
-    let apiKey = process.env.GEMINI_API_KEY;
-    let isOpenRouter = false;
+    let apiKey = cleanApiKey(process.env.OPENROUTER_API_KEY) || undefined;
+    console.log(`[/api/chat] Loaded OPENROUTER_API_KEY from process.env: ${apiKey ? `found (length=${apiKey.length}, startsWith=${apiKey.substring(0, 12)}...)` : "not found or filtered as dummy"}`);
+    let isOpenRouter = !!apiKey;
 
-    // Check if we have a restaurant specific API token
-    if (restaurantId) {
+    // Check if we have a restaurant specific API token as fallback
+    if (!apiKey && restaurantId) {
       try {
         const db = loadDatabase();
         const resto = db.restaurants[restaurantId];
         if (resto && resto.apiToken && resto.apiToken.trim() !== "") {
-          const customKey = resto.apiToken.trim();
-          if (customKey.startsWith("sk-")) {
-            apiKey = customKey;
-            isOpenRouter = true;
-          } else {
-            apiKey = customKey;
+          const customKey = cleanApiKey(resto.apiToken);
+          if (customKey) {
+            if (customKey.startsWith("sk-")) {
+              apiKey = customKey;
+              isOpenRouter = true;
+            } else {
+              apiKey = customKey;
+              isOpenRouter = false;
+            }
           }
         }
       } catch (err) {
@@ -48,16 +95,18 @@ app.use((req, res, next) => {
       }
     }
 
+    // Default fallback to GEMINI_API_KEY if neither of the above are set
     if (!apiKey) {
-      if (process.env.OPENROUTER_API_KEY) {
-        apiKey = process.env.OPENROUTER_API_KEY;
-        isOpenRouter = true;
+      const geminiKey = cleanApiKey(process.env.GEMINI_API_KEY);
+      if (geminiKey) {
+        apiKey = geminiKey;
+        isOpenRouter = false;
       }
     }
 
     if (!apiKey) {
       console.error("No API key configured for chat.");
-      return res.status(500).json({ error: "AI Service API Key is not configured." });
+      return res.status(500).json({ error: "AI Service API Key is not configured. Please supply a valid OPENROUTER_API_KEY or GEMINI_API_KEY via Secrets." });
     }
 
     let finalSystemInstruction = systemInstruction;
@@ -65,8 +114,64 @@ app.use((req, res, next) => {
       finalSystemInstruction += `\n\n## LANGUAGE DIRECTIVE\n- The user's preferred language is: ${language}.\n- YOU MUST RESPOND SOLELE AND EXCLUSIVELY IN ${language.toUpperCase()}.\n- Regardless of your default prompt settings or previous dialogue language, output all statements in ${language}. Keep the conversation friendly, helpful, natural, and fully localized to native speaker conventions in ${language}.`;
     }
 
+    // Helper for native Gemini streaming
+    const streamGemini = async (gKey: string) => {
+      const ai = new GoogleGenAI({
+        apiKey: gKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
+
+      const geminiContents = (history || []).map((msg: any) => ({
+        role: msg.role === "assistant" ? "model" : "user",
+        parts: [{ text: msg.content || "" }]
+      }));
+      geminiContents.push({
+        role: "user",
+        parts: [{ text: message }]
+      });
+
+      const responseStream = await ai.models.generateContentStream({
+        model: "gemini-3.5-flash",
+        contents: geminiContents,
+        config: {
+          systemInstruction: finalSystemInstruction,
+          temperature: 0.7,
+        }
+      });
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+
+      const heartbeatInterval = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(": heartbeat\n\n");
+          if ((res as any).flush) (res as any).flush();
+        }
+      }, 10000);
+
+      try {
+        for await (const chunk of responseStream) {
+          const content = chunk.text || "";
+          if (content) {
+            res.write(`data: ${JSON.stringify({ text: content })}\n\n`);
+            if ((res as any).flush) (res as any).flush();
+          }
+        }
+        res.write("data: [DONE]\n\n");
+      } finally {
+        clearInterval(heartbeatInterval);
+      }
+    };
+
     // 1. If using OpenRouter fallback
     if (isOpenRouter) {
+      console.log("[/api/chat] Attempting chat request using OpenRouter...");
       const host = req.headers.host || "localhost:3000";
       const protocol = req.protocol || (host.includes("localhost") ? "http" : "https");
       const referer = process.env.APP_URL || `${protocol}://${host}`;
@@ -117,13 +222,31 @@ app.use((req, res, next) => {
         } finally {
           clearInterval(heartbeatInterval);
         }
+        return;
       } catch (error: any) {
-        console.error("OpenRouter API Error:", error);
-        const errorMessage = error.message || "Failed to fetch response from AI";
-        if (!res.headersSent) {
-          res.status(500).json({ error: errorMessage });
+        console.warn("[/api/chat] OpenRouter API Error:", error.message || error);
+        
+        // If OpenRouter authentication or quota fails, try to fall back to the preconfigured native Gemini key
+        if (process.env.GEMINI_API_KEY) {
+          console.log("[/api/chat] Triggering automatic native Gemini API fallback...");
+          try {
+            await streamGemini(process.env.GEMINI_API_KEY);
+            return;
+          } catch (fallbackError: any) {
+            console.error("[/api/chat] Gemini Fallback also failed:", fallbackError);
+            if (!res.headersSent) {
+              res.status(500).json({ error: `Fallback failed: ${fallbackError.message}` });
+            } else {
+              res.write(`data: ${JSON.stringify({ error: `Fallback failed: ${fallbackError.message}` })}\n\n`);
+            }
+          }
         } else {
-          res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+          const errorMessage = error.message || "Failed to fetch response from AI";
+          if (!res.headersSent) {
+            res.status(500).json({ error: errorMessage });
+          } else {
+            res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+          }
         }
       } finally {
         res.end();
@@ -133,57 +256,7 @@ app.use((req, res, next) => {
 
     // 2. Default: Native Gemini API Streaming (using @google/genai)
     try {
-      const ai = new GoogleGenAI({
-        apiKey: apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
-        }
-      });
-
-      const geminiContents = (history || []).map((msg: any) => ({
-        role: msg.role === "assistant" ? "model" : "user",
-        parts: [{ text: msg.content || "" }]
-      }));
-      geminiContents.push({
-        role: "user",
-        parts: [{ text: message }]
-      });
-
-      const responseStream = await ai.models.generateContentStream({
-        model: "gemini-3.5-flash",
-        contents: geminiContents,
-        config: {
-          systemInstruction: finalSystemInstruction,
-          temperature: 0.7,
-        }
-      });
-
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache, no-transform");
-      res.setHeader("Connection", "keep-alive");
-      res.setHeader("X-Accel-Buffering", "no");
-
-      const heartbeatInterval = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(": heartbeat\n\n");
-          if ((res as any).flush) (res as any).flush();
-        }
-      }, 10000);
-
-      try {
-        for await (const chunk of responseStream) {
-          const content = chunk.text || "";
-          if (content) {
-            res.write(`data: ${JSON.stringify({ text: content })}\n\n`);
-            if ((res as any).flush) (res as any).flush();
-          }
-        }
-        res.write("data: [DONE]\n\n");
-      } finally {
-        clearInterval(heartbeatInterval);
-      }
+      await streamGemini(apiKey);
     } catch (error: any) {
       console.error("Gemini API Error in chat:", error);
       const errorMessage = error.message || "Failed to fetch response from Gemini";
@@ -205,20 +278,23 @@ app.use((req, res, next) => {
         return res.status(400).json({ error: "Missing config or targetLanguage" });
       }
 
-      let apiKey = process.env.GEMINI_API_KEY;
-      let isOpenRouter = false;
+      let apiKey = cleanApiKey(process.env.OPENROUTER_API_KEY) || undefined;
+      let isOpenRouter = !!apiKey;
 
-      if (restaurantId) {
+      if (!apiKey && restaurantId) {
         try {
           const db = loadDatabase();
           const resto = db.restaurants[restaurantId];
           if (resto && resto.config && resto.apiToken && resto.apiToken.trim() !== "") {
-            const customKey = resto.apiToken.trim();
-            if (customKey.startsWith("sk-")) {
-              apiKey = customKey;
-              isOpenRouter = true;
-            } else {
-              apiKey = customKey;
+            const customKey = cleanApiKey(resto.apiToken);
+            if (customKey) {
+              if (customKey.startsWith("sk-")) {
+                apiKey = customKey;
+                isOpenRouter = true;
+              } else {
+                apiKey = customKey;
+                isOpenRouter = false;
+              }
             }
           }
         } catch (err) {
@@ -227,15 +303,16 @@ app.use((req, res, next) => {
       }
 
       if (!apiKey) {
-        if (process.env.OPENROUTER_API_KEY) {
-          apiKey = process.env.OPENROUTER_API_KEY;
-          isOpenRouter = true;
+        const geminiKey = cleanApiKey(process.env.GEMINI_API_KEY);
+        if (geminiKey) {
+          apiKey = geminiKey;
+          isOpenRouter = false;
         }
       }
 
       if (!apiKey) {
         console.error("No API key configured for translation.");
-        return res.status(500).json({ error: "AI Service API Key is not configured." });
+        return res.status(500).json({ error: "AI Service API Key is not configured. Please supply a valid OPENROUTER_API_KEY or GEMINI_API_KEY via Secrets." });
       }
 
       const fieldsToTranslate = {
@@ -275,30 +352,59 @@ ${JSON.stringify(fieldsToTranslate, null, 2)}`;
       let content = "";
 
       if (isOpenRouter) {
-        const host = req.headers.host || "localhost:3000";
-        const protocol = req.protocol || (host.includes("localhost") ? "http" : "https");
-        const referer = process.env.APP_URL || `${protocol}://${host}`;
+        try {
+          const host = req.headers.host || "localhost:3000";
+          const protocol = req.protocol || (host.includes("localhost") ? "http" : "https");
+          const referer = process.env.APP_URL || `${protocol}://${host}`;
 
-        const openai = new OpenAI({
-          baseURL: "https://openrouter.ai/api/v1",
-          apiKey: apiKey,
-          defaultHeaders: {
-            "HTTP-Referer": referer,
-            "X-Title": "RestoHost AI Translate",
+          const openai = new OpenAI({
+            baseURL: "https://openrouter.ai/api/v1",
+            apiKey: apiKey,
+            defaultHeaders: {
+              "HTTP-Referer": referer,
+              "X-Title": "RestoHost AI Translate",
+            }
+          });
+
+          const response = await openai.chat.completions.create({
+            model: "openrouter/free",
+            messages: [
+              { role: "system", content: "You output only raw, valid, minified JSON without markdown formatting." },
+              { role: "user", content: prompt }
+            ],
+            max_tokens: 3000,
+            temperature: 0.1,
+          });
+
+          content = response.choices[0]?.message?.content || "";
+        } catch (error: any) {
+          console.warn("[/api/translate-config] OpenRouter API Error:", error.message || error);
+          if (process.env.GEMINI_API_KEY) {
+            console.log("[/api/translate-config] Triggering automatic native Gemini API fallback...");
+            const ai = new GoogleGenAI({
+              apiKey: process.env.GEMINI_API_KEY,
+              httpOptions: {
+                headers: {
+                  'User-Agent': 'aistudio-build',
+                }
+              }
+            });
+
+            const response = await ai.models.generateContent({
+              model: "gemini-3.5-flash",
+              contents: prompt,
+              config: {
+                systemInstruction: "You are a highly professional restaurant translator JSON mode. Output only the requested JSON without any surrounding markdown code blocks (no ```json).",
+                responseMimeType: "application/json",
+                temperature: 0.1,
+              }
+            });
+
+            content = response.text || "";
+          } else {
+            throw error;
           }
-        });
-
-        const response = await openai.chat.completions.create({
-          model: "openrouter/free",
-          messages: [
-            { role: "system", content: "You output only raw, valid, minified JSON without markdown formatting." },
-            { role: "user", content: prompt }
-          ],
-          max_tokens: 3000,
-          temperature: 0.1,
-        });
-
-        content = response.choices[0]?.message?.content || "";
+        }
       } else {
         const ai = new GoogleGenAI({
           apiKey: apiKey,
